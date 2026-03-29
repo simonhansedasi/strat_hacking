@@ -5,33 +5,30 @@ Game rules:
 - Each player has a hand of dog cards (dealt from shuffled deck).
 - Each round, each player chooses a face-up trick, executes it, flips trick face-down.
 - When all tricks are face-down, flip all face-up again (new cycle).
-  The last trick flipped face-up in each cycle gains 1 treat token.
-  (Simplified: each trick gets +1 treat when cycle resets.)
+  When a cycle resets, 1 treat token is placed on each trick from the shared supply.
 - On execution: treats on a trick go to the player who uses it, then treats reset to 0.
 - After a player's turn: score any completed dogs (remove from hand, add to scored pile).
-- If a player busts: all dice on dogs and in yard are cleared (dogs reset, yard cleared).
+- If a player busts: all dice on dogs and in yard are cleared and returned to supply.
 - Win condition: first player to score 6 dogs wins.
-- Ties broken by treats, then arbitrarily.
 
-Dog dealing: each player is dealt a starting hand from the shuffled dog deck.
+Hard limits enforced: 20 treat tokens, 40 dice (shared physical components).
 """
 from __future__ import annotations
 import json
 import os
 import random
-import copy
 from dataclasses import dataclass, field
 from typing import Optional
 
-from spots.game import DogCard, PlayerState
+from spots.game import DogCard, PlayerState, Pool
 from spots.tricks import deal_tricks
 from spots.strategies import BaseStrategy
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-WIN_DOGS       = 6       # dogs scored to win
-STARTING_HAND  = 3       # dogs dealt to each player at start
-MAX_DOGS       = 6       # max dogs a player can hold at once
+WIN_DOGS       = 6
+STARTING_HAND  = 3
+MAX_DOGS       = 6
 DATA_DIR       = os.path.join(os.path.dirname(__file__), 'data')
 
 
@@ -51,11 +48,36 @@ def load_dog_deck(path: str = None) -> list[DogCard]:
 
 @dataclass
 class GameResult:
-    winner: int              # player index
-    scores: list[int]        # dogs scored per player
-    treats: list[int]        # treats at end per player
-    turns: int               # total turns taken
-    busts: list[int]         # bust count per player
+    winner: int
+    scores: list[int]
+    treats: list[int]
+    turns: int
+    busts: list[int]
+
+
+# ── Pool helpers ───────────────────────────────────────────────────────────────
+
+def _dice_in_use(players: list[PlayerState]) -> int:
+    total = 0
+    for p in players:
+        for d in p.dogs:
+            total += sum(d.filled)   # list[bool] — sum counts True
+        total += len(p.yard)
+    return total
+
+
+def _return_dice_for_bust(player: PlayerState, pool: Pool) -> None:
+    count = sum(sum(d.filled) for d in player.dogs) + len(player.yard)
+    player.bust()
+    pool.dice += count
+
+
+def _return_dice_for_score(player: PlayerState, pool: Pool) -> int:
+    complete = player.complete_dogs
+    count = sum(sum(d.filled) for d in complete)
+    scored = player.score_complete_dogs()
+    pool.dice += count
+    return scored
 
 
 # ── Single game ────────────────────────────────────────────────────────────────
@@ -68,7 +90,6 @@ def run_game(
 ) -> GameResult:
     n_players = len(strategies)
 
-    # Deal dogs
     deck = load_dog_deck()
     rng.shuffle(deck)
     players = [PlayerState() for _ in range(n_players)]
@@ -77,7 +98,7 @@ def run_game(
             if deck:
                 player.dogs.append(deck.pop(0))
 
-    # Deal tricks — shared trick row (all players see the same tricks)
+    pool = Pool(treats=20, dice=40 - _dice_in_use(players))
     tricks = deal_tricks(rng)
     bust_counts = [0] * n_players
     turns = 0
@@ -87,44 +108,38 @@ def run_game(
         for pi, (player, strategy) in enumerate(zip(players, strategies)):
             turns += 1
 
-            # Howl: if player has room for a dog, the howl trick can draw from deck
-            # The deck is passed to trick functions
-
-            # Choose a face-up trick
             face_up = [t for t in tricks if t['face_up']]
             if not face_up:
-                # Shouldn't happen but be safe
                 break
             chosen = strategy.choose_trick(player, tricks)
 
-            # Collect treats from the trick tile
+            # Tile treats go to player; they were already drawn from pool when placed.
             player.treats += chosen.get('treats', 0)
             chosen['treats'] = 0
 
             # Execute trick
             fn = chosen['fn']
-            # Some tricks need special kwargs
             fn_name = fn.__name__
             if fn_name == 'stay':
                 facedown_count = sum(1 for t in tricks if not t['face_up'] and t is not chosen)
-                fn(player, deck, strategy, rng, facedown_count=facedown_count)
+                fn(player, deck, strategy, rng, pool, facedown_count=facedown_count)
             elif fn_name == 'dig':
-                fn(player, deck, strategy, rng, all_players=players)
+                fn(player, deck, strategy, rng, pool, all_players=players)
             else:
-                fn(player, deck, strategy, rng)
+                fn(player, deck, strategy, rng, pool)
 
-            # Track bust
+            # Handle bust
             if player.is_busted:
                 bust_counts[pi] += 1
-                player.bust()
+                _return_dice_for_bust(player, pool)
 
-            # Score completed dogs
-            scored_now = player.score_complete_dogs()
-            # Draw replacement dogs from deck
+            # Score completed dogs, return their dice
+            _return_dice_for_score(player, pool)
+
+            # Draw replacement dogs
             while len(player.dogs) < min(starting_hand, MAX_DOGS) and deck:
                 player.dogs.append(deck.pop(0))
 
-            # Check win
             if player.scored >= win_dogs:
                 winner = pi
                 break
@@ -132,41 +147,43 @@ def run_game(
             # Flip trick face-down
             chosen['face_up'] = False
 
-            # Cycle check: if all tricks are now face-down, flip all face-up
-            # and award 1 treat to each (representing the treat tokens)
+            # Cycle reset: flip all face-up and place 1 treat on each from supply
             if all(not t['face_up'] for t in tricks):
                 for t in tricks:
                     t['face_up'] = True
-                    t['treats'] += 1
+                    if pool.treats > 0:
+                        t['treats'] += 1
+                        pool.treats -= 1
 
         if winner is not None:
             break
 
-        # Safety valve: avoid infinite games on weird states
         if turns > 2000:
-            # Declare winner by score, break ties by treats
             winner = max(range(n_players),
                          key=lambda i: (players[i].scored, players[i].treats))
             break
 
-    scores  = [p.scored  for p in players]
-    treats  = [p.treats  for p in players]
-    return GameResult(winner=winner, scores=scores, treats=treats,
-                      turns=turns, busts=bust_counts)
+    return GameResult(
+        winner=winner,
+        scores=[p.scored for p in players],
+        treats=[p.treats for p in players],
+        turns=turns,
+        busts=bust_counts,
+    )
 
 
 # ── Multi-game simulation ──────────────────────────────────────────────────────
 
 @dataclass
 class SimStats:
-    n_games:      int
-    n_players:    int
+    n_games:        int
+    n_players:      int
     strategy_names: list[str]
-    win_rates:    list[float]
-    avg_score:    list[float]
-    avg_treats:   list[float]
-    avg_busts:    list[float]
-    avg_turns:    float
+    win_rates:      list[float]
+    avg_score:      list[float]
+    avg_treats:     list[float]
+    avg_busts:      list[float]
+    avg_turns:      float
 
     def __str__(self):
         lines = [f"Simulation: {self.n_games} games, {self.n_players} players"]
@@ -182,22 +199,18 @@ class SimStats:
 
 
 def simulate(
-    strategy_factories: list,          # list of callables: rng -> Strategy
+    strategy_factories: list,
     strategy_names: list[str],
     n_games: int = 10_000,
     seed: int = 42,
 ) -> SimStats:
-    """
-    Run n_games games, rotating which strategy occupies which seat.
-    strategy_factories[i] is called each game with the game's rng.
-    """
     rng = random.Random(seed)
     n = len(strategy_factories)
 
-    wins      = [0]  * n
-    scores    = [0.0] * n
-    treats    = [0.0] * n
-    busts     = [0.0] * n
+    wins        = [0]   * n
+    scores      = [0.0] * n
+    treats      = [0.0] * n
+    busts       = [0.0] * n
     total_turns = 0
 
     for _ in range(n_games):
@@ -223,7 +236,7 @@ def simulate(
     )
 
 
-# ── CLI entry point ────────────────────────────────────────────────────────────
+# ── CLI ────────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     from spots.strategies import RandomStrategy, GreedyStrategy, ConservativeStrategy
@@ -232,7 +245,7 @@ if __name__ == '__main__':
         lambda rng: RandomStrategy(rng),
         lambda rng: GreedyStrategy(rng),
         lambda rng: ConservativeStrategy(rng),
-        lambda rng: GreedyStrategy(rng),   # 2nd greedy as baseline
+        lambda rng: GreedyStrategy(rng),
     ]
     names = ['Random', 'Greedy-1', 'Conservative', 'Greedy-2']
 

@@ -115,3 +115,14 @@ class PlayerState:
     def all_open_spaces(self) -> list[int]:
         """All die values still needed across all incomplete dogs."""
         return [v for dog in self.incomplete_dogs for v in dog.open_spaces]
+
+
+@dataclass
+class Pool:
+    """
+    Shared physical components — hard limits enforced by the simulation.
+    treats: tokens in the central supply (not held by any player or tile).
+    dice:   dice currently available to roll (not placed on dogs or in yards).
+    """
+    treats: int = 20
+    dice: int = 40
