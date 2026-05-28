@@ -23,6 +23,7 @@ from typing import Optional
 from spots.game import DogCard, PlayerState, Pool
 from spots.tricks import deal_tricks
 from spots.strategies import BaseStrategy
+from copy import deepcopy
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -233,6 +234,120 @@ def simulate(
         avg_treats=[t / n_games for t in treats],
         avg_busts=[b / n_games for b in busts],
         avg_turns=total_turns / n_games,
+    )
+
+
+# ── Detailed game result (dog-level tracking) ────────────────────────────────
+
+@dataclass
+class DetailedGameResult:
+    winner:        int
+    scores:        list[int]
+    treats:        list[int]
+    turns:         int
+    busts:         list[int]
+    # dog tracking — one list per player
+    starting_dogs: list[list[str]]   # dogs in hand at game start
+    scored_dogs:   list[list[str]]   # dogs completed, in order
+    final_dogs:    list[list[str]]   # dogs still held (incomplete) at game end
+
+
+def run_game_detailed(
+    strategies: list[BaseStrategy],
+    rng: random.Random,
+    starting_hand: int = STARTING_HAND,
+    win_dogs: int = WIN_DOGS,
+) -> DetailedGameResult:
+    """
+    Like run_game but also tracks which dog cards each player starts with,
+    scores, and holds at game end.
+    """
+    n_players = len(strategies)
+
+    deck = load_dog_deck()
+    rng.shuffle(deck)
+    players = [PlayerState() for _ in range(n_players)]
+    for player in players:
+        for _ in range(starting_hand):
+            if deck:
+                player.dogs.append(deck.pop(0))
+
+    # Record starting hands immediately after deal
+    starting_dogs = [[d.name for d in p.dogs] for p in players]
+    scored_dogs   = [[] for _ in range(n_players)]
+
+    pool = Pool(treats=20, dice=40 - _dice_in_use(players))
+    tricks = deal_tricks(rng)
+    bust_counts = [0] * n_players
+    turns = 0
+    winner = None
+
+    while winner is None:
+        for pi, (player, strategy) in enumerate(zip(players, strategies)):
+            turns += 1
+
+            face_up = [t for t in tricks if t['face_up']]
+            if not face_up:
+                break
+            chosen = strategy.choose_trick(player, tricks)
+
+            player.treats += chosen.get('treats', 0)
+            chosen['treats'] = 0
+
+            fn = chosen['fn']
+            fn_name = fn.__name__
+            if fn_name == 'stay':
+                facedown_count = sum(1 for t in tricks if not t['face_up'] and t is not chosen)
+                fn(player, deck, strategy, rng, pool, facedown_count=facedown_count)
+            elif fn_name == 'dig':
+                fn(player, deck, strategy, rng, pool, all_players=players)
+            else:
+                fn(player, deck, strategy, rng, pool)
+
+            if player.is_busted:
+                bust_counts[pi] += 1
+                _return_dice_for_bust(player, pool)
+
+            # Capture which dogs are about to be scored before removing them
+            just_scored = [d.name for d in player.complete_dogs]
+            _return_dice_for_score(player, pool)
+            scored_dogs[pi].extend(just_scored)
+
+            while len(player.dogs) < min(starting_hand, MAX_DOGS) and deck:
+                player.dogs.append(deck.pop(0))
+
+            if player.scored >= win_dogs:
+                winner = pi
+                break
+
+            chosen['face_up'] = False
+
+            if all(not t['face_up'] for t in tricks):
+                for t in tricks:
+                    t['face_up'] = True
+                    if pool.treats > 0:
+                        t['treats'] += 1
+                        pool.treats -= 1
+
+        if winner is not None:
+            break
+
+        if turns > 2000:
+            winner = max(range(n_players),
+                         key=lambda i: (players[i].scored, players[i].treats))
+            break
+
+    final_dogs = [[d.name for d in p.dogs] for p in players]
+
+    return DetailedGameResult(
+        winner=winner,
+        scores=[p.scored for p in players],
+        treats=[p.treats for p in players],
+        turns=turns,
+        busts=bust_counts,
+        starting_dogs=starting_dogs,
+        scored_dogs=scored_dogs,
+        final_dogs=final_dogs,
     )
 
 
