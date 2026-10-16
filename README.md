@@ -44,6 +44,25 @@ Multiplayer dice game (5-player head-to-head). Scoring is triangular: n crosses 
 
 Balanced dominates with 72.4% win rate. Key insight: consecutive crosses (gap=0) over jumping to higher positions. Triangular scoring means more total crosses beats any individual high-position cross.
 
+### Royal Game of Ur
+
+2-player race game (~2500 BCE). Round-robin tournament across 6 strategies.
+
+**Balanced dominates** (82% overall). Key insight: avoiding vulnerable shared-zone squares and prioritising captures compounds strongly. Safe > Aggressive: surviving without getting sent back matters more than capture attempts.
+
+### Viticulture
+
+4-player worker-placement wine-production game. Race to 25 VP: plant vines → harvest grapes → make wine → fill orders.
+
+| Strategy  | Win%  | Avg VP | Orders/g |
+|-----------|-------|--------|----------|
+| Random    | 0.5%  | 2.7    | 0.71     |
+| Expansion | 13.5% | 10.4   | 2.23     |
+| OrderRush | 18.2% | 11.9   | 3.67     |
+| Balanced  | 67.7% | 18.7   | 4.16     |
+
+Balanced dominates (67.7%). OrderRush beats Expansion by converting production to VP through orders rather than investing in infrastructure first.
+
 ## Running simulations
 
 ```python
